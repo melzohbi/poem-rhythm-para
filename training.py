@@ -2,7 +2,7 @@
 # Portions of the original code have been modified to fit the specific requirements
 # of this project. Credit goes to the original authors for their contributions.
 
-from trainers import PoetryCVTrainer
+from trainers import PoetryCVTrainer, PoetryParaphraseTrainer
 import wandb
 from argparse import ArgumentParser
 
@@ -62,7 +62,7 @@ if __name__ == "__main__":
     )
     argument_parser.add_argument(
         "--model_name_or_path",
-        default="google/byt5-small",
+        default="google/byt5-base",
         help="name of the base model in huggingface hub or path if local",
     )
     argument_parser.add_argument(
@@ -111,6 +111,26 @@ if __name__ == "__main__":
         help="description of the experiment",
     )
 
+    argument_parser.add_argument(
+        "--paraphrase",
+        action="store_true",
+        help="Should we consider the paraphrasing objective instead?",
+    )
+
+    # get dataset directory
+    argument_parser.add_argument(
+        "--dataset_dir",
+        default="data",
+        help="directory where the dataset is stored",
+    )
+
+    # resume from checkpoint, default is None
+    argument_parser.add_argument(
+        "--resume_from_checkpoint",
+        default=None,
+        help="resume training from a checkpoint",
+    )
+
     args = argument_parser.parse_args()
 
     if args.debug:
@@ -130,14 +150,14 @@ if __name__ == "__main__":
     wandb.login()
     run = wandb.init(
         # Set the project where this run will be logged
-        project="poetry_CV_training",
+        project="poetry_CV_training" if not args.paraphrase else "poetry_paraphrase_training",
         # Track hyperparameters and run metadata
         config=args.__dict__,
     )
 
     # Set up trainer
     Trainer = partial(
-        PoetryCVTrainer,
+        PoetryCVTrainer if not args.paraphrase else PoetryParaphraseTrainer,
         output_dir=join(args.out_dir, basename(args.model_name_or_path)),
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_acc_steps,
@@ -145,7 +165,8 @@ if __name__ == "__main__":
         test_run=args.debug,
         model_type=args.type,
         multiple_words=args.multiple_words,
-        ablation=args.ablation
+        ablation=args.ablation,
+        dataset_dir=args.dataset_dir
     )
 
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path)
@@ -154,7 +175,11 @@ if __name__ == "__main__":
     trainer = Trainer(model=model, tokenizer=tokenizer)
 
     # train
-    trainer.train()
+    if args.resume_from_checkpoint is None:
+        trainer.train()
+    else:
+        trainer.train(
+            resume_from_checkpoint=args.resume_from_checkpoint)
 
     # save model
     trainer.save_model()

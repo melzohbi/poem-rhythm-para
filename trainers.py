@@ -3,7 +3,7 @@
 # of this project. Credit goes to the original authors for their contributions.
 
 from uniformer_utils.utils import AbstractPoetryLMTrainer
-from uniformer_utils.process_english import QuatrainV2Processing
+from uniformer_utils.process_english import QuatrainV2Processing, ParaphraseCorvProcessing
 from uniformer_utils.metrics import load_metric
 import random
 import wandb
@@ -19,8 +19,14 @@ from transformers.utils import logging
 from transformers import AutoTokenizer, XLMRobertaForSequenceClassification
 from dp.phonemizer import Phonemizer
 import numpy as np
-from datasets import load_from_disk
+from datasets import Dataset, load_from_disk
 from uniformer_utils.datasets import load_dataset
+import pandas as pd
+import ast
+from nltk.util import ngrams
+from collections import Counter
+from tqdm import tqdm
+
 
 logger = logging.get_logger("transformers")
 
@@ -179,6 +185,29 @@ def _tokenizer_v2_binary(examples, tokenizer, is_encoder_decoder=False, multiple
 
         inputs.append(text_masked + "<extra_id_2>")
         labels.append(chosen_word_text)
+
+    if is_encoder_decoder:
+        model_inputs = tokenizer(inputs, add_special_tokens=False)
+
+        # added to update the attention mask for ablation study
+        if ablation:
+            model_inputs["attention_mask"] = update_attention_mask(
+                model_inputs["input_ids"], model_inputs["attention_mask"])
+
+        labels = tokenizer(labels)
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+    else:
+        return tokenizer(_add_special_tokens(tokenizer, [i + l for i, l in zip(inputs, labels)]))
+
+
+def _tokenizer_paraphrase_binary(examples, tokenizer, is_encoder_decoder=False, ablation=False):
+    inputs, labels = list(), list()
+
+    for id, verse in enumerate(examples['clean_text']):
+        inputs.append(verse + "<extra_id_0>" +
+                      examples['para_binary'][id].replace(',', "") + "<extra_id_1>")
+        labels.append(examples['clean_paraphrases'][id])
 
     if is_encoder_decoder:
         model_inputs = tokenizer(inputs, add_special_tokens=False)
@@ -392,6 +421,278 @@ class PoetryCVTrainer(AbstractPoetryLMTrainer):
             },
             load_from_cache_file=False
         )
+
+        if low_res:
+            tokenized_dataset, eval_tokenized_dataset = tokenized_dataset.train_test_split(
+                test_size=(0.001 if not test else 0.5)).values()
+        else:
+            tokenized_dataset, eval_tokenized_dataset = tokenized_dataset.train_test_split(
+                test_size=(0.005 if not test else 0.5)).values()  # pyright: ignore
+
+        index = randrange(len(tokenized_dataset))
+        sample = tokenized_dataset[index]
+        detokenized = self.decode(sample["input_ids"])
+        logger.info(
+            f"Input sample {index} of the training set: {sample['input_ids']}")
+        logger.info(
+            f"Input sample {index} of the training set (detokenized): {detokenized}")
+        if "labels" in sample:  # pyright: ignore
+            detokenized = self.decode(sample["labels"])
+            logger.info(
+                f"Label sample {index} of the training set: {sample['labels']}")
+            logger.info(
+                f"Label sample {index} of the training set (detokenized): {detokenized}")
+
+        return tokenized_dataset, eval_tokenized_dataset
+
+
+class PoetryParaphraseTrainer(AbstractPoetryLMTrainer):
+    def __init__(
+        self,
+        model,
+        lang="en",
+        batch_size=128,
+        test_run=False,
+        low_resource=False,
+        model_type="binary",
+        multiple_words=False,
+        ablation=False,
+        dataset_dir=None,
+        **kwargs,
+    ):
+
+        super().__init__(
+            model=model,
+            batch_size=batch_size,
+            test_run=test_run,
+            eval_multiplier=5 if test_run else 75,  # not needed
+            **kwargs,
+        )
+
+        self.eval_table = wandb.Table(columns=["ex_id", "original sentence", "corv_wanted", "predicted sentence", "pinc_score",
+                                      "corv_score", "lev_score", "similarity_score", "similarity_pinc_score"])
+
+        if model.config.is_encoder_decoder:
+            data_collator = DataCollatorForSeq2Seq(self.tokenizer, self.model)
+        else:
+            data_collator = DataCollatorForLanguageModeling(
+                self.tokenizer, mlm=False)
+
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+
+        # TODO: this can be arguments.
+        phonemizer_checkpoint = 'en_us_cmudict_ipa_forward.pt'
+
+        logger.info(f"Loading phonemizer model {phonemizer_checkpoint}")
+        self.phonemizer = Phonemizer.from_checkpoint(phonemizer_checkpoint)
+
+        train_data, eval_data = self.load_dataset(
+            batch_size,
+            test_run,
+            low_resource,
+            ablation,
+            dataset_dir,
+        )
+
+        super(AbstractPoetryLMTrainer, self).__init__(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            args=self.args,
+            data_collator=data_collator,
+            train_dataset=train_data,
+            eval_dataset=eval_data,
+            compute_metrics=partial(
+                self.compute_metrics,
+                lang,
+                batch_size,
+                model_type,
+            ),
+            **self.trainer_args,
+        )
+
+    def save_state(self):
+        super().save_state()
+        if wandb.run:
+            wandb.run.log({"eval_table": self.eval_table})
+
+    def pinc_score(self, original, paraphrase, n=4):
+        """Calculate the PINC score for the given original and paraphrase texts."""
+
+        sum = 0
+        index = 0
+        for i in range(1, n+1):
+            original_ngrams = ngrams(original, i)
+            paraphrase_ngrams = ngrams(paraphrase, i)
+
+            # calculare intersection of ngrams between original and paraphrase
+            original_counter = Counter(original_ngrams)
+            paraphrase_counter = Counter(paraphrase_ngrams)
+
+            if original_counter and paraphrase_counter:
+                index += 1
+                intersection_counter = original_counter & paraphrase_counter
+                try:
+                    sum += 1 - len(intersection_counter) / \
+                        len(paraphrase_counter)
+                except ZeroDivisionError:
+                    # print(original)
+                    # print(paraphrase)
+                    sum += 1
+
+            # very different cases
+            if index == 0:
+                if original_counter:
+                    return 1
+                else:
+                    return 0
+
+        return sum / index
+
+    def compute_metrics(self, lang, bs, model_type, p):
+        labels = p.label_ids[0] if isinstance(
+            p.label_ids, tuple) else p.label_ids
+        labels = self.decode(
+            where(labels == -100, self.tokenizer.pad_token_id, labels), batch=True)
+        # remove "<pad>" and "</s>" from the labels
+        labels = [label.replace("<pad>", "").replace("</s>", "")
+                  for label in labels]
+        preds = super().compute_metrics(p)
+        corv_string_list = list()
+        for idx, pred in enumerate(preds):
+            tokenized = self.tokenizer.tokenize(pred)
+            # mask_token = self.tokenizer.tokenize(" [MASK] ")
+            corv_list = tokenized[tokenized.index(
+                '<extra_id_0>')+1:tokenized.index('<extra_id_1>')]
+            corv_string_list.append(
+                self.tokenizer.convert_tokens_to_string(corv_list).replace(" ", ""))
+
+            preds[idx] = self.tokenizer.convert_tokens_to_string(
+                tokenized[tokenized.index('<extra_id_1>')+1:]).replace("<pad>", "")
+
+        logger.info(
+            f"Computing metrics with the convowel metric and the cohwordorig metrics")
+        corv_string_list = [corv.strip() for corv in corv_string_list]
+
+        if model_type == "binary":
+            convowel_score = load_metric("convowelencode", batch_size=bs, phonemizer=self.phonemizer).compute(
+                predicted_words=preds, corv=corv_string_list)
+
+        else:
+            convowel_score = load_metric("convowel", language=lang, batch_size=bs, phonemizer=self.phonemizer).compute(
+                predicted_words=preds, corv=corv_string_list)
+
+        similarity_paraphrase_score = load_metric("pinc_score", batch_size=bs).compute(
+            original=labels, predicted_paraphrase=preds)
+
+        for idx in random.sample(range(len(preds)), 100):
+            self.eval_table.add_data(idx, labels[idx], corv_string_list[idx], preds[idx], similarity_paraphrase_score['pinc_score'],
+                                     convowel_score['corv_score'], convowel_score['lev_score'], similarity_paraphrase_score['cosine_similarity'], similarity_paraphrase_score['normalized_pinc_score'])
+
+        return convowel_score | similarity_paraphrase_score
+
+    def patch_tokenizer(self):
+        super().patch_tokenizer()
+        if not self.tokenizer.additional_special_tokens:
+            special = {
+                "additional_special_tokens": [f"<extra_id_{idx}>" for idx in range(3)],
+                'pad_token': '<pad>'
+            }
+            self.tokenizer.add_special_tokens(special)  # pyright: ignore
+            self.model.resize_token_embeddings(len(self.tokenizer))
+
+    def process_dataset(self, version="LT"):
+        tqdm.pandas()
+
+        df['pinc_score'] = df.progress_apply(
+            lambda x: self.pinc_score(x['text'], x['paraphrases']), axis=1)
+        df['text_length'] = df['text'].apply(len)
+        df['paraphrase_length'] = df['paraphrases'].apply(len)
+
+        # remove the ones with length more than 128 and less than 8 from any of the text or the paraphrases
+        df = df[(df['text_length'] >= 8) & (df['text_length'] <= 128) & (
+            df['paraphrase_length'] >= 8) & (df['paraphrase_length'] <= 128)]
+
+        if version == "LT":
+            df = df[(df['pinc_score'] >= 0.2) & (df['pinc_score'] <= 0.8)]
+        else:
+            df = df[(df['pinc_score'] >= 0.5) & (df['pinc_score'] <= 0.9)]
+
+        inverse_df = df.copy()
+        inverse_df[['text', 'paraphrases']
+                   ] = inverse_df[['paraphrases', 'text']].values
+        result_df = pd.concat([df, inverse_df], ignore_index=True)
+
+        # Randomly select 3 million examples from the result_df
+        # sampled_df = result_df.sample(n=3000000, random_state=42)
+
+        df = result_df.drop(
+            columns=['pinc_score', 'text_length', 'paraphrase_length'])
+
+        return df
+
+    def load_dataset(self, bs, test, low_res, ablation, dataset_dir=None):
+
+        logger.info(f"Loading PARAPOETRY dataset")
+        raw_dataset = load_dataset("json", data_files=dataset_dir)
+
+        raw_dataset = raw_dataset['train']
+
+        if test:
+            raw_dataset = raw_dataset[:1000]
+            raw_dataset = Dataset.from_dict(raw_dataset)
+
+        # explode the paraphrases to have original-paraphrase pairs
+        df = pd.DataFrame(raw_dataset)
+        df = df.explode('paraphrases', ignore_index=True)
+
+        # drop duplicates
+        df.drop_duplicates()
+
+        df = self.process_dataset(version="LT")
+
+        raw_dataset = Dataset.from_pandas(df)  # .shuffle(seed=42)
+
+        # Dataset from dict
+        logger.info(f"Processing dataset with phonemizer")
+        dataset = raw_dataset.map(
+            ParaphraseCorvProcessing(
+                phonemizer=self.phonemizer,
+                batch_size=bs,
+            ),
+            batched=True,
+        )
+
+        tokenized_dataset = load_from_disk(dataset_dir)
+
+        # tokenizing the dataset.
+        logger.info(f"Tokenizing dataset with the paraphrase binary version")
+        tokenized_dataset = dataset.map(
+            _tokenizer_paraphrase_binary,
+            batched=True,
+            fn_kwargs={  # pyright: ignore
+                "tokenizer": self.tokenizer,
+                "is_encoder_decoder": self.model.config.is_encoder_decoder,
+                "ablation": ablation,
+            },
+            load_from_cache_file=False
+        )
+
+        # save the dataset to disk to save time
+        # tokenized_dataset.save_to_disk(
+        #     "parapoetry_3mil_0.5_0.9_fixed.hf")
+
+        # # load the dataset from disk to save time
+        # dataset = load_from_disk("english_quatrainv_Apr22.hf")
+        # tokenized_dataset = load_from_disk(
+        #     "datasets/Parapoetry_tokenized_2mil.hf")['train']
+
+        # tokenized_dataset = load_from_disk(dataset_dir)
+
+        # dataset.cleanup_cache_files()
+
+        tokenized_dataset = tokenized_dataset.remove_columns(
+            ['para_phonemes', 'clean_paraphrases', 'clean_text', 'para_corvs', 'para_binary'])
 
         if low_res:
             tokenized_dataset, eval_tokenized_dataset = tokenized_dataset.train_test_split(

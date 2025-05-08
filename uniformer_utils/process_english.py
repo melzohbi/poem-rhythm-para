@@ -49,6 +49,39 @@ def process(examples, phonemizer, bs):
     return examples
 
 
+def para_process(examples, phonemizer, bs):
+    text_clean = clean_lines(examples["text"])
+    para_clean = clean_lines(examples["paraphrases"])
+
+    phoneme_string_batch = phonemizer(
+        para_clean, lang='en_us', batch_size=bs)
+
+    if "para_phonemes" not in examples:
+        examples["para_phonemes"] = [None] * len(phoneme_string_batch)
+
+    if "para_corvs" not in examples:
+        examples["para_corvs"] = [None] * len(phoneme_string_batch)
+
+    if "para_binary" not in examples:
+        examples["para_binary"] = [None] * len(phoneme_string_batch)
+
+    if "clean_text" not in examples:
+        examples["clean_text"] = [None] * len(text_clean)
+
+    if "clean_paraphrases" not in examples:
+        examples["clean_paraphrases"] = [None] * len(para_clean)
+
+    for idx, phoneme_string in enumerate(phoneme_string_batch):
+        phoneme_string_list = phoneme_string.split()
+        examples["para_phonemes"][idx] = ",".join(phoneme_string_list)
+        examples["para_corvs"][idx] = ",".join(corv(phoneme_string_list))
+        examples["para_binary"][idx] = ",".join(
+            (b_encoding(phoneme_string_list)))
+        examples["clean_text"][idx] = text_clean[idx]
+        examples["clean_paraphrases"][idx] = para_clean[idx]
+    return examples
+
+
 def corv(phoneme_string_list):
     corv = list()
     for word_phoneme in phoneme_string_list:
@@ -89,17 +122,19 @@ def get_corv(phonemes):
     phonemes = Pronunciation.from_string(phonemes.replace("-", ""))
     corv_string = ""
     for idx, phone in enumerate(phonemes):
-        if phone.is_vowel or "ɝ" in str(phone):
+        if phone.is_vowel:
             if idx == 0:
-                corv_string += "S"
+                corv_string += "C"
             if len(phone.letters) == 2 or phone.is_long:
-                corv_string += "VV"
+                corv_string += "VC"
             else:
                 corv_string += "V"
+        elif "ɝ" in str(phone):
+            corv_string += "VC"
         elif phone.is_consonant:
             corv_string += "C"
         elif "ː" in str(phone):
-            corv_string += "V"
+            corv_string += "C"
         else:
             # print(phone)
             corv_string += "X"
@@ -114,4 +149,14 @@ class QuatrainV2Processing:
 
     def __call__(self, examples):
         examples = process(examples, self.phonemizer, self.bs)
+        return examples
+
+
+class ParaphraseCorvProcessing:
+    def __init__(self, phonemizer, batch_size=1):
+        self.bs = batch_size
+        self.phonemizer = phonemizer
+
+    def __call__(self, examples):
+        examples = para_process(examples, self.phonemizer, self.bs)
         return examples

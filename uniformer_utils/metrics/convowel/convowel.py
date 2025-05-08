@@ -10,6 +10,7 @@ from uniformer_utils.process_english import get_corv
 from transformers.utils import logging
 import random
 from Levenshtein import distance as levenshtein_distance
+import rapidfuzz.distance.Levenshtein as _Levenshtein
 
 logger = logging.get_logger("transformers")
 
@@ -78,10 +79,13 @@ class Convowel(datasets.metric.Metric):
 
         for i in range(0, len(predicted_words)):
             scores.append(float(predicted_words[i] == corv[i]))
-            distance = levenshtein_distance(
+            score = _Levenshtein.normalized_similarity(
                 predicted_words[i], corv[i])
-            # convert distance to a score between 0 and 1 similarity (max score must be 0)
-            score = 1 - min(distance / (len(predicted_words[i]) + 0.0005), 1)
+
+            # distance = levenshtein_distance(
+            #     predicted_words[i], corv[i])
+            # # convert distance to a score between 0 and 1 similarity (max score must be 0)
+            # score = 1 - min(distance / (len(predicted_words[i]) + 0.0005), 1)
 
             lev_distances.append(score)
 
